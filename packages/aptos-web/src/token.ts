@@ -1,20 +1,14 @@
 import type {
   Network,
   PendingTransactionResponse,
-  UserTransactionResponse,
+  KeylessPublicKey,
+  AccountPublicKey,
 } from '@aptos-labs/ts-sdk';
 import {
   Aptos,
   AptosConfig as AptosSDKConfig,
   MimeType,
   postAptosFullNode,
-  Ed25519PublicKey,
-  TransactionAuthenticatorEd25519,
-  AccountAuthenticatorEd25519,
-  Ed25519Signature,
-  SignedTransaction,
-  generateSignedTransaction,
-  generateSigningMessageForTransaction,
 } from '@aptos-labs/ts-sdk';
 import type { Signer } from '@irys/bundles';
 import { InjectedAptosSigner, AptosSigner } from '@irys/bundles/web';
@@ -48,8 +42,15 @@ type NetworkInfo = {
   url?: string;
 };
 
+type IPublickey = {
+  publicKey: KeylessPublicKey;
+};
+
 export type AptosWallet = {
-  account: { address: string; publicKey: string };
+  account: {
+    address: string;
+    publicKey: string | IPublickey | AccountPublicKey;
+  };
   connect: () => void;
   disconnect: () => void;
   connected: boolean;
@@ -63,7 +64,7 @@ export default class AptosConfig extends BaseWebToken {
   protected declare providerInstance?: Aptos;
   protected signerInstance!: InjectedAptosSigner | AptosSigner;
   protected declare wallet: AptosWallet;
-  protected _publicKey!: Buffer;
+  protected _publicKey!: AccountPublicKey;
   protected aptosConfig!: AptosSDKConfig;
   protected signingFn?: (msg: Uint8Array) => Promise<Uint8Array>;
 
@@ -122,16 +123,31 @@ export default class AptosConfig extends BaseWebToken {
   getSigner(): Signer {
     if (this.signerInstance) return this.signerInstance;
     if (this.signingFn) {
-      const signer = new AptosSigner(
-        '',
-        '0x' + this._publicKey.toString('hex')
-      );
+      const signer = new AptosSigner('', '0x' + this._publicKey.toString());
       signer.sign = this.signingFn; // override signer fn
       return (this.signerInstance = signer);
     }
+
+    if (
+      (
+        (this.wallet.account.publicKey as IPublickey)
+          ?.publicKey as KeylessPublicKey
+      )?.idCommitment
+    ) {
+      const publicKey = (
+        (this.wallet.account.publicKey as IPublickey)
+          ?.publicKey as KeylessPublicKey
+      )?.idCommitment;
+
+      return (this.signerInstance = new InjectedAptosSigner(
+        this.wallet,
+        Buffer.from(publicKey)
+      ));
+    }
+
     return (this.signerInstance = new InjectedAptosSigner(
       this.wallet,
-      this._publicKey
+      (this._publicKey as any).key.data
     ));
   }
 
@@ -177,41 +193,13 @@ export default class AptosConfig extends BaseWebToken {
       },
     });
 
-    const accountAuthenticator = new AccountAuthenticatorEd25519(
-      new Ed25519PublicKey(await this.getPublicKey()),
-      new Ed25519Signature(new Uint8Array(64))
-    );
-
-    const transactionAuthenticator = new TransactionAuthenticatorEd25519(
-      accountAuthenticator.public_key,
-      accountAuthenticator.signature
-    );
-
-    const signedSimulation = new SignedTransaction(
-      transaction.rawTransaction,
-      transactionAuthenticator
-    ).bcsToBytes();
-
-    const queryParams = {
-      estimate_gas_unit_price: true,
-      estimate_max_gas_amount: true,
-    };
-
-    const { data } = await postAptosFullNode<
-      Uint8Array,
-      UserTransactionResponse[]
-    >({
-      aptosConfig: this.aptosConfig,
-      body: signedSimulation,
-      path: 'transactions/simulate',
-      params: queryParams,
-      originMethod: 'simulateTransaction',
-      contentType: MimeType.BCS_SIGNED_TRANSACTION,
+    const [simulation] = await client.transaction.simulate.simple({
+      transaction,
     });
 
     return {
-      gasUnitPrice: +data[0].gas_unit_price,
-      maxGasAmount: +data[0].max_gas_amount,
+      gasUnitPrice: Number(simulation.gas_unit_price),
+      maxGasAmount: Number(simulation.max_gas_amount),
     };
 
     // const simulationResult = await client.simulateTransaction(this.accountInstance, rawTransaction, { estimateGasUnitPrice: true, estimateMaxGasAmount: true });
@@ -266,19 +254,9 @@ export default class AptosConfig extends BaseWebToken {
     // @ts-expect-error type issue
     const transaction = await client.transaction.build.simple(txData);
 
-    const message = generateSigningMessageForTransaction(transaction);
+    const signedTransaction =
+      await this.wallet.signAndSubmitTransaction(transaction);
 
-    const signerSignature = await this.sign(message);
-
-    const senderAuthenticator = new AccountAuthenticatorEd25519(
-      new Ed25519PublicKey(await this.getPublicKey()),
-      new Ed25519Signature(signerSignature)
-    );
-
-    const signedTransaction = generateSignedTransaction({
-      transaction,
-      senderAuthenticator,
-    });
     return { txId: undefined, tx: signedTransaction };
     // const rawTransaction = await client.generateRawTransaction(this.accountInstance.address(), payload);
     // const bcsTxn = AptosClient.generateBCSTransaction(this.accountInstance, rawTransaction);
@@ -289,12 +267,7 @@ export default class AptosConfig extends BaseWebToken {
   }
 
   async getPublicKey(): Promise<string | Buffer> {
-    return (this._publicKey ??= this.signingFn
-      ? (Buffer.from(
-          (this.wallet as unknown as string).slice(2),
-          'hex'
-        ) as unknown as Buffer)
-      : Buffer.from(this.wallet.account.publicKey.toString().slice(2), 'hex'));
+    return Buffer.from(this.wallet.account.publicKey.toString());
   }
 
   public async ready(): Promise<void> {
@@ -305,8 +278,9 @@ export default class AptosConfig extends BaseWebToken {
       network: this.providerUrl,
       ...this.config?.opts?.aptosSdkConfig,
     });
-    this._publicKey = (await this.getPublicKey()) as Buffer;
-    this._address = await this.ownerToAddress(this._publicKey);
+
+    this._publicKey = this.wallet.account.publicKey as AccountPublicKey;
+    this._address = this._publicKey.authKey().derivedAddress().toString();
 
     const client = await this.getProvider();
 
